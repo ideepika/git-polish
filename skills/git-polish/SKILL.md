@@ -1,6 +1,6 @@
 ---
 name: git-polish
-description: Open a branch's commits in the user's editor so they can edit code and commit messages, then fold the edits back into the commits they belong to (absorb + autosquash rebase, rewording edited messages). Use when the user asks to review, edit, polish, fix up or reword the commits on a branch, says "/git-polish", or says they finished editing ("apply", "done editing", "fold my changes in").
+description: Open a branch's commits in the user's editor so they can edit code and commit messages, then fold the edits back into the commits they belong to (absorb + autosquash rebase, rewording edited messages). Use when the user asks to review, edit, polish, fix up or reword the commits on a branch, says "/git-polish", or says they finished editing ("apply", "done editing", "fold my changes in"), or asks to check commits for leaks, secrets or confidential names before pushing.
 ---
 
 # Review and edit a branch's commits
@@ -40,6 +40,17 @@ Report which commits changed, which were reworded, and what is left.
   `git rebase --abort` or reset without asking; the user's edits are in that
   state.
 - `git-polish abort` removes `.git/polish/` only; edits stay.
+
+## Leak check
+
+`git-polish check [<rev>...]` scans commits (default: the review's, else the
+unpushed ones) for secrets, names on the user's forbid list, machine-name
+author emails, private IPs and home paths. It runs on start and after apply.
+Report every LEAK line to the user verbatim and stop before any push until
+they decide; for warnings, mention them. Never print an unmasked secret,
+never add `polish:allow` or use `--no-verify` on your own, and never copy
+the forbid list (`~/.config/git-polish/forbid`) into a repo, commit or
+message. `git-polish install-hook` adds a pre-push hook to the repo.
 
 ## Rules
 

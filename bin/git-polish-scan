@@ -1,0 +1,122 @@
+#!/usr/bin/env perl
+# git-polish-scan <rev-list args>...  -- look for leaks in commits.
+#
+# Scans the added lines, commit messages and author/committer identities of
+# the given commits (default: HEAD --not --remotes) for:
+#   LEAK  secrets (keys, tokens, credentials), names on your private forbid
+#         list, and author emails that expose a machine name (*.local, ...)
+#   warn  private IP addresses and home-directory paths
+#
+# The forbid list (customer names, internal hosts, ...) is one
+# case-insensitive Perl regex per line in ~/.config/git-polish/forbid,
+# plus `git config --get-all polish.forbid`. Keep it out of any repo.
+# `git config polish.email <addr>` flags commits by any other address.
+# A line containing "polish:allow" is skipped. gitleaks is used too when
+# installed.
+#
+# Exit status: 1 if any LEAK, else 0.
+
+use strict;
+use warnings;
+
+my @range = @ARGV ? @ARGV : ('HEAD', '--not', '--remotes');
+
+sub git { open(my $fh, '-|', 'git', @_) or die "git: $!"; local $/; my $o = <$fh>; close $fh; $o // '' }
+
+my @secret = (
+  ['private key',           qr/-----BEGIN [A-Z ]*PRIVATE KEY-----/],
+  ['AWS key',               qr/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/],
+  ['GitHub token',          qr/\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})/],
+  ['Slack token',           qr/\bxox[abprs]-[A-Za-z0-9-]{10,}/],
+  ['API key',               qr/\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}/],
+  ['Google API key',        qr/\bAIza[0-9A-Za-z_-]{35}\b/],
+  ['JWT',                   qr/\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\./],
+  ['cephx key',             qr/\bAQ[A-Za-z0-9+\/]{38}==/],
+  ['credential',            qr/(?i)\b(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)\b["']?\s*[:=]\s*["'][^"'\s]{8,}["']/],
+  ['URL with password',     qr{(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]{3,}@}],
+);
+my @warn = (
+  ['private IP',            qr/\b(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b/],
+  ['home path',             qr{(?:/Users/|/home/)[A-Za-z][\w.-]+}],
+);
+
+my @forbid;
+for my $f ("$ENV{HOME}/.config/git-polish/forbid") {
+  open(my $fh, '<', $f) or next;
+  while (<$fh>) { chomp; s/^\s+|\s+$//g; next if $_ eq '' || /^#/; push @forbid, $_ }
+}
+push @forbid, grep { length } split /\n/, git('config', '--get-all', 'polish.forbid');
+@forbid = map { my $p = $_; my $re = eval { qr/$p/i }; $re ? ['forbidden', $re] : () } @forbid;
+my $want_email = git('config', 'polish.email'); chomp $want_email;
+
+my (@leaks, @warns, %seen);
+sub mask { my $s = shift; length($s) > 8 ? substr($s, 0, 4) . '...' : '****' }
+sub add {
+  my ($list, $sha, $where, $kind, $match, $hide) = @_;
+  return if $seen{"$sha $where $kind"}++;
+  push @$list, sprintf("%s %-28s %s: %s", $sha, $where, $kind, $hide ? mask($match) : $match);
+}
+sub check {
+  my ($sha, $where, $text) = @_;
+  return if $text =~ /polish:allow/;
+  for (@secret) { add(\@leaks, $sha, $where, $_->[0], $&, 1) if $text =~ $_->[1] }
+  for (@forbid) { add(\@leaks, $sha, $where, $_->[0], $&, 0) if $text =~ $_->[1] }
+  for (@warn)   { add(\@warns, $sha, $where, $_->[0], $&, 0) if $text =~ $_->[1] }
+}
+
+my @shas = split /\n/, git('rev-list', @range);
+exit 0 unless @shas;
+die sprintf("git-polish-scan: %d commits is too many to scan; narrow the range\n", scalar @shas) if @shas > 2000;
+
+# Identities and messages.
+for (split /\x01/, git('log', '--no-walk=unsorted', '--format=%x01%h%x00%an <%ae>%x00%cn <%ce>%x00%B', @shas)) {
+  next unless length;
+  my ($sha, $author, $committer, $body) = split /\x00/, $_, 4;
+  for my $id ($author, $committer) {
+    my ($email) = $id =~ /<([^>]*)>/;
+    $email //= '';
+    if ($email =~ /\.(?:local|lan|home|localdomain|internal)$|\@localhost$|\@[^.]*$/i) {
+      add(\@leaks, $sha, 'author', 'machine-name email', $id, 0);
+    } elsif ($want_email ne '' && lc $email ne lc $want_email) {
+      add(\@leaks, $sha, 'author', "not $want_email", $id, 0);
+    }
+    for (@forbid) { add(\@leaks, $sha, 'author', $_->[0], $&, 0) if $id =~ $_->[1] }
+  }
+  check($sha, 'message', $_) for split /\n/, $body // '';
+}
+
+# Added lines.
+my ($sha, $file, $ln) = ('', undef, 0);
+for (split /\n/, git('log', '--no-walk=unsorted', '-p', '-U0', '--no-color', '--no-ext-diff', '--format=%x01%h', @shas)) {
+  if (/^\x01(\S+)/) { $sha = $1; $file = undef; next }
+  if (/^\+\+\+ (?:b\/(.*)|\/dev\/null)/) { $file = $1; next }
+  if (/^@@ .*\+(\d+)/) { $ln = $1; next }
+  next unless defined $file && /^\+(.*)/;
+  check($sha, "$file:$ln", $1);
+  $ln++;
+}
+
+# gitleaks, when installed, as a second opinion.
+if (system('sh', '-c', 'command -v gitleaks >/dev/null') == 0) {
+  require File::Temp; require JSON::PP;
+  my (undef, $tmp) = File::Temp::tempfile(SUFFIX => '.json', UNLINK => 1);
+  system('gitleaks', 'git', '--no-banner', '--redact', '--exit-code', '0', '--log-level', 'error',
+         '--report-format', 'json', '--report-path', $tmp, '--log-opts', join(' ', @range));
+  if (open(my $fh, '<', $tmp)) {
+    local $/; my $j = <$fh>; close $fh;
+    my $list = eval { JSON::PP::decode_json($j) } || [];
+    for my $f (@$list) {
+      my $c = git('rev-parse', '--short', $f->{Commit}); $c =~ s/\s+$//;
+      add(\@leaks, $c, "$f->{File}:$f->{StartLine}", "gitleaks $f->{RuleID}", '(redacted)', 0);
+    }
+  }
+}
+
+exit 0 unless @leaks || @warns;
+printf "git polish: %d possible leak%s, %d warning%s in %d commit%s\n",
+  scalar @leaks, @leaks == 1 ? '' : 's', scalar @warns, @warns == 1 ? '' : 's',
+  scalar @shas, @shas == 1 ? '' : 's';
+print "  LEAK $_\n" for @leaks;
+print "  warn $_\n" for @warns;
+print "  (fix, or mark a line intended with polish:allow)\n" if @leaks;
+exit(@leaks ? 1 : 0);

@@ -9,7 +9,7 @@ export GIT_POLISH_EDITOR=none GIT_CONFIG_GLOBAL=/dev/null
 fail() { echo "FAIL: $*"; exit 1; }
 
 cd "$t"
-git init -q -b main; git config user.email t@t; git config user.name T
+git init -q -b main; git config user.email t@example.com; git config user.name T
 printf 'a1\na2\na3\n' > a.c; printf 'b1\nb2\n' > b.c
 git add .; git commit -qm base
 git checkout -qb feat
@@ -44,5 +44,44 @@ ev UserPromptSubmit | "$hook"; ev Stop | "$hook"; sleep 1
 ev UserPromptSubmit | "$hook"; echo c > c.c; git add c.c; git commit -qm "c: new"
 ev Stop | "$hook"; sleep 2
 [ -d .git/polish ] || fail "hook did not open after a commit"
+
+# Leak check.
+scan="$here/bin/git-polish-scan"
+export HOME="$t/home"; mkdir -p "$HOME"
+git checkout -q main; git checkout -qb leaky
+tok="ghp_$(printf 'a%.0s' $(seq 36))"            # built here so the repo holds no token
+echo "token = \"$tok\"" > s.c; git add s.c; git commit -qm "s: add"
+out=$("$scan" main..HEAD) && fail "token not flagged"
+echo "$out" | grep -q 'LEAK.*GitHub token: ghp_\.\.\.' || fail "token report: $out"
+echo "$out" | grep -q "$tok" && fail "token printed unmasked"
+
+git reset -q --hard main
+echo "host = 10.1.2.3" > ip.c; git add ip.c; git commit -qm "ip: add"
+out=$("$scan" main..HEAD) || fail "a warning must not fail"
+echo "$out" | grep -q 'warn.*private IP' || fail "IP not warned"
+
+echo "secret plan for $(echo QWNtZUNvcnA= | base64 -d)" > n.c; git add n.c; git commit -qm "n: add"
+"$scan" main..HEAD >/dev/null || fail "flagged a name with no forbid list"
+git config polish.forbid 'acme ?corp'
+"$scan" main..HEAD | grep -q 'LEAK.*forbidden: AcmeCorp' || fail "forbid list"
+git config --unset polish.forbid
+
+echo "x = \"$tok\" # polish:allow" > a2.c; git add a2.c; git commit -qm "a2: add"
+"$scan" HEAD^! | grep -q LEAK && fail "polish:allow ignored"
+
+git -c user.email=me@laptop.local commit -q --allow-empty -m "empty"
+"$scan" HEAD^! | grep -q 'machine-name email' || fail "machine email"
+git reset -q --hard HEAD^
+
+# pre-push hook blocks a leak, allows a clean push.
+git init -q --bare "$t/remote.git"; git remote add r "$t/remote.git"
+"$polish" install-hook >/dev/null
+git push -q r main 2>/dev/null || fail "clean push blocked"
+echo "token = \"$tok\"" > s.c; git add s.c; git commit -qm "s: again"
+git push -q r leaky >/dev/null 2>&1 && fail "leaky push allowed"
+
+# Plugin hook asks before Claude pushes a leak.
+pj=$(printf '{"tool_input":{"command":"git push r leaky"},"cwd":"%s"}' "$t")
+printf '%s' "$pj" | "$here/hooks/check-before-push.sh" | grep -q '"ask"' || fail "push hook"
 
 echo "all tests passed"
