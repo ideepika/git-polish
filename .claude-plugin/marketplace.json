@@ -1,0 +1,15 @@
+{
+  "name": "git-polish",
+  "description": "git-polish plugin for Claude Code",
+  "owner": { "name": "Deepika Upadhyay", "url": "https://github.com/ideepika" },
+  "plugins": [
+    {
+      "name": "git-polish",
+      "description": "Review a branch's commits in your editor, then fold edits back into the right commits",
+      "source": "./",
+      "version": "0.1.0",
+      "category": "development",
+      "tags": ["git", "rebase", "review"]
+    }
+  ]
+}

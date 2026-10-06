@@ -1,0 +1,11 @@
+{
+  "description": "Open git polish when a turn ends with new commits",
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/open-on-commit.sh", "timeout": 10 } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/open-on-commit.sh", "timeout": 10 } ] }
+    ]
+  }
+}

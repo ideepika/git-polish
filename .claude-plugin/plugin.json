@@ -1,0 +1,9 @@
+{
+  "name": "git-polish",
+  "description": "Review a branch's commits in your editor, then fold code and message edits back into the commits they belong to",
+  "version": "0.1.0",
+  "author": { "name": "Deepika Upadhyay", "url": "https://github.com/ideepika" },
+  "homepage": "https://github.com/ideepika/git-polish",
+  "license": "MIT",
+  "keywords": ["git", "rebase", "fixup", "absorb", "code-review"]
+}

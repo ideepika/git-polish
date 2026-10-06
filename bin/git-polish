@@ -1,0 +1,166 @@
+#!/bin/sh
+# git polish — review a branch's commits in VS Code, then fold edits back in.
+#
+#   git polish [<base>]   open the branch in VS Code: every changed file,
+#                         plus .git/polish/ with one editable message file
+#                         and one read-only diff per commit
+#   git polish apply      fold your edits back into the commits they belong to:
+#                         code edits go to the commit that last touched those
+#                         lines (git absorb, then an autosquash rebase), and
+#                         edited message files reword their commit
+#   git polish into <N>   put what is still staged/modified into commit N
+#   git polish abort      drop the review state (your edits are kept)
+#
+# <base> defaults to `git config polish.base`, else the merge-base with the
+# remote's default branch (origin/HEAD, origin/main, origin/master).
+# The editor is $GIT_POLISH_EDITOR, else `git config polish.editor`, else
+# VS Code's `code`; set it to `cursor`, `subl`, ... or `none`.
+# Needs git-absorb. Nothing is ever pushed.
+
+set -e
+die() { echo "git polish: $*" >&2; exit 1; }
+case "${1:-}" in -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+
+top=$(git rev-parse --show-toplevel) || exit 1
+gitdir=$(git rev-parse --absolute-git-dir)
+dir="$gitdir/polish"
+state="$dir/state"
+editor=${GIT_POLISH_EDITOR:-$(git config polish.editor || true)}
+if [ -z "$editor" ]; then
+  editor=$(command -v code ||
+    echo "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code")
+fi
+
+default_base() {
+  b=$(git config polish.base || true)
+  [ -n "$b" ] && { git merge-base HEAD "$b"; return; }
+  for r in origin/HEAD origin/main origin/master main master; do
+    git rev-parse -q --verify "$r^{commit}" >/dev/null &&
+      { git merge-base HEAD "$r"; return; }
+  done
+  return 1
+}
+
+in_progress() { [ -d "$gitdir/rebase-merge" ] || [ -d "$gitdir/rebase-apply" ]; }
+
+# Commits base..HEAD oldest first, one per line: "<sha>"
+commits() { git rev-list --reverse "$1..HEAD"; }
+
+slug() { git log -1 --format=%s "$1" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-50 | sed 's/-*$//'; }
+
+start() {
+  in_progress && die "a rebase is in progress; finish it first"
+  base=${1:-$(default_base)} || die "no base found; pass one: git polish <base>"
+  base=$(git rev-parse "$base")
+  n=$(git rev-list --count "$base..HEAD")
+  [ "$n" -gt 0 ] || die "no commits between base and HEAD"
+  [ "$n" -le 40 ] || die "$n commits since base; pass a closer base (git polish <base>)"
+
+  rm -rf "$dir"; mkdir -p "$dir"
+  i=0; index="$dir/00-INDEX.md"
+  {
+    echo "# Review: $(git branch --show-current) ($n commits on $(git log -1 --format=%h "$base"))"
+    echo
+    echo "Edit code anywhere in the tree and the *.msg files here, then run"
+    echo "\`git polish apply\`. Code edits go to the commit that last touched"
+    echo "those lines; anything new goes with \`git polish into <N>\`."
+    echo
+  } > "$index"
+  for c in $(commits "$base"); do
+    i=$((i + 1)); nn=$(printf %02d "$i"); s=$(slug "$c")
+    git log -1 --format=%B "$c" > "$dir/$nn-$s.msg"
+    git show --stat --patch --format='commit %H%n%n%B' "$c" > "$dir/$nn-$s.diff"
+    chmod a-w "$dir/$nn-$s.diff"
+    echo "$nn  $(git log -1 --format=%s "$c")  ($nn-$s.msg / .diff)" >> "$index"
+  done
+  printf 'base=%s\nhead=%s\n' "$base" "$(git rev-parse HEAD)" > "$state"
+
+  files=$(git diff --name-only --diff-filter=d "$base" HEAD | sed "s|^|$top/|")
+  if [ "$editor" != none ] && command -v "$editor" >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
+    "$editor" "$top" "$index" $files "$dir"/*.msg >/dev/null 2>&1 &
+    echo "Opened $n commits in $(basename "$editor"). Review files: $dir"
+  else
+    echo "$n commits ready to review. Review files: $dir"
+  fi
+}
+
+load() {
+  [ -f "$state" ] || die "no review in progress; run git polish first"
+  . "$state"
+}
+
+apply_() {
+  load
+  in_progress && die "a rebase is in progress; finish or abort it first"
+  [ "$(git rev-parse HEAD)" = "$head" ] ||
+    echo "note: HEAD moved since the review started; messages are matched by position"
+  before=$(git rev-parse HEAD)
+
+  # 1. Code edits -> the commits that last touched those lines.
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    command -v git-absorb >/dev/null || die "needs git-absorb (brew/cargo install git-absorb)"
+    git add -u
+    git absorb --base "$base" --and-rebase ||
+      die "absorb/rebase stopped; resolve, then git rebase --continue and re-run apply"
+  fi
+
+  # 2. Edited messages -> reword by position.
+  base_now=$base
+  todo=""
+  i=0
+  for c in $(commits "$base_now"); do
+    i=$((i + 1)); nn=$(printf %02d "$i")
+    f=$(ls "$dir/$nn"-*.msg 2>/dev/null | head -1)
+    [ -n "$f" ] || continue
+    if ! git log -1 --format=%B "$c" | cmp -s - "$f"; then
+      todo="$todo $nn"
+    fi
+  done
+  if [ -n "$todo" ]; then
+    seq_ed="$dir/seq-editor"
+    cat > "$seq_ed" <<EOF
+#!/bin/sh
+# Add an amend after each pick whose message file changed.
+awk -v todo="$todo" -v dir="$dir" '
+  BEGIN { n = split(todo, t, " "); for (k = 1; k <= n; k++) want[t[k] + 0] = 1 }
+  /^pick / { i++; print; if (want[i]) {
+      cmd = "ls " dir "/" sprintf("%02d", i) "-*.msg"; cmd | getline f; close(cmd)
+      print "exec git commit --amend -q -F \"" f "\"" }
+    next }
+  { print }' "\$1" > "\$1.new" && mv "\$1.new" "\$1"
+EOF
+    chmod +x "$seq_ed"
+    GIT_SEQUENCE_EDITOR="$seq_ed" git rebase -q -i "$base_now" ||
+      die "reword stopped (commit-msg hook or conflict); fix, git rebase --continue"
+  fi
+
+  left=$(git status --porcelain --untracked-files=normal | grep -v '^??' || true)
+  new=$(git status --porcelain | grep '^??' || true)
+  printf 'head=%s\nbase=%s\n' "$(git rev-parse HEAD)" "$base" > "$state"
+  echo
+  git range-diff -s "$base" "$before" HEAD 2>/dev/null | sed 's/^/  /' || true
+  [ -z "$todo" ] || echo "Reworded:$todo"
+  [ -z "$left" ] || { echo "Not absorbed (no commit owns these lines):"; echo "$left";
+                      echo "Put them in a commit with: git polish into <N>"; }
+  [ -z "$new" ] || { echo "Untracked (not touched):"; echo "$new"; }
+}
+
+into() {
+  load
+  [ -n "$1" ] || die "usage: git polish into <N>"
+  c=$(commits "$base" | sed -n "$(($1 + 0))p")
+  [ -n "$c" ] || die "no commit $1"
+  git add -u
+  git diff --cached --quiet && die "nothing to add"
+  git commit -q --no-verify --fixup="$c"
+  GIT_SEQUENCE_EDITOR=: git rebase -q -i --autosquash "$base"
+  echo "Folded into $1: $(git log -1 --format=%s "$(commits "$base" | sed -n "$(($1 + 0))p")")"
+}
+
+case "${1:-}" in
+  apply) apply_ ;;
+  into) shift; into "$@" ;;
+  abort) rm -rf "$dir"; echo "polish state removed" ;;
+  *) start "$@" ;;
+esac
