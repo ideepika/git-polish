@@ -36,6 +36,29 @@ sed 's/^a1$/a1-new/' a.c > x && mv x a.c
 git show HEAD~1 | grep -q '^+a1-new' || fail "into 1"
 [ -z "$(git status --porcelain)" ] || fail "tree clean"
 
+# Step mode: each commit is shown as uncommitted changes plus COMMIT_MSG;
+# edits and a reworded COMMIT_MSG go into that commit.
+git checkout -q -b steps main
+echo s1 > s.txt; git add s.txt; git commit -qm "s: new file"
+echo a4 >> a.c; git commit -qam "a: add a4"
+touch junk.tmp                                  # untracked before: never committed
+"$polish" step main | grep -q 'Commit 1/2: s: new file' || fail "step 1 shown"
+git diff --name-only | grep -qx s.txt || fail "new file shown as a diff"
+grep -qx 's: new file' COMMIT_MSG || fail "COMMIT_MSG"
+echo s1-fixed > s.txt; echo extra > extra.txt
+echo "s: new files, reworded" > COMMIT_MSG
+"$polish" next | grep -q 'Commit 2/2: a: add a4' || fail "step 2 shown"
+sed 's/a4/a4-fixed/' a.c > x && mv x a.c
+"$polish" apply | grep -q 'Done' || fail "step done"
+[ "$(git log -1 --format=%s HEAD~1)" = "s: new files, reworded" ] || fail "step reword"
+git show HEAD~1 | grep -q '^+s1-fixed' || fail "step edit in commit 1"
+git show --stat HEAD~1 | grep -q extra.txt || fail "new file in commit 1"
+git show HEAD | grep -q '^+a4-fixed' || fail "step edit in commit 2"
+git show --stat HEAD~1 HEAD | grep -q -e COMMIT_MSG -e junk.tmp && fail "COMMIT_MSG or junk committed"
+[ "$(git log -1 --format=%an HEAD)" = T ] || fail "author kept"
+[ ! -e COMMIT_MSG ] && [ ! -d .git/polish ] && [ ! -d .git/rebase-merge ] || fail "step cleanup"
+rm junk.tmp; git checkout -q feat
+
 # The hook opens a review only when HEAD moved.
 "$polish" abort >/dev/null
 ev() { printf '{"hook_event_name":"%s","session_id":"test-%s","cwd":"%s"}' "$1" $$ "$t"; }

@@ -23,6 +23,19 @@ commit an editable `NN-<subject>.msg` and a read-only `NN-<subject>.diff`.
 Tell the user in one line that it is open and to say "apply" when done.
 Do not edit their files meanwhile.
 
+## Step mode (Warp)
+
+When the user reviews in Warp's code review panel (or any panel that only
+shows uncommitted changes), or the editor is `warp`, run `git-polish step
+[<base>]` instead. It stops on each commit with its diff uncommitted and its
+message in a temporary `COMMIT_MSG` file at the top of the tree. Tell the user
+which commit is shown and to say "next" (or "apply") when done with it; then
+run `git-polish next`, which commits their edits and the message into that
+commit and shows the next. Repeat until it prints "Done.", then report the
+range-diff. A conflict from an earlier edit shows as markers in the next
+commit; the user removes them, then `next`. Do not edit their files between
+steps. `git rebase --abort` restores the original branch: ask first.
+
 ## Apply
 
 Run `git-polish apply`. It:

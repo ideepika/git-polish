@@ -26,7 +26,7 @@ case "$event" in
     gitdir=$(git rev-parse --absolute-git-dir)
     [ -d "$gitdir/rebase-merge" ] || [ -d "$gitdir/rebase-apply" ] && exit 0
     case "$(git branch --show-current)" in main|master|"") exit 0 ;; esac
-    nohup "$(dirname "$0")/../bin/git-polish" >/dev/null 2>&1 &
+    GIT_POLISH_AUTO=1 nohup "$(dirname "$0")/../bin/git-polish" >/dev/null 2>&1 &
     ;;
 esac
 exit 0

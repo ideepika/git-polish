@@ -14,6 +14,25 @@ git polish check      # scan the commits for leaks
 git polish install-hook   # block pushes that leak (pre-push hook)
 ```
 
+## Step mode (Warp and other working-tree review panels)
+
+```
+git polish step       # or set polish.editor=warp and run git polish
+# ...the first commit's diff is now uncommitted changes, plus a COMMIT_MSG file...
+git polish next       # commit your edits and COMMIT_MSG into it, show the next
+```
+
+Review panels like Warp's show only uncommitted changes. Step mode runs an
+interactive rebase that stops on every commit and un-commits it, so the panel
+shows exactly that commit's diff and a temporary `COMMIT_MSG` file holding its
+message. Edit either; `next` (or `apply`) commits everything you changed into
+that commit, keeping its author, and moves on. Files you create during a step
+join that commit; untracked files that were already there do not. If an edit
+conflicts with a later commit, that commit opens with conflict markers;
+remove them and run `next`. To bail out, `git rebase --abort` (drops the edits
+made in the current step; earlier steps are already committed in the rebase,
+so this restores the original branch).
+
 `git polish` opens every file the branch changed, plus `.git/polish/` with an
 index, an editable message file and a read-only diff per commit. `apply`
 stages your edits, runs [git-absorb](https://github.com/tummychow/git-absorb)
@@ -71,10 +90,10 @@ Then ask Claude to "polish the commits on this branch", edit, and say
 | Setting | Default |
 |---|---|
 | base | `git config polish.base`, else merge-base with `origin/HEAD`, `origin/main` or `origin/master`; or pass `git polish <base>` |
-| editor | `$GIT_POLISH_EDITOR`, else `git config polish.editor`, else VS Code `code`; `none` just prints the paths |
+| editor | `$GIT_POLISH_EDITOR`, else `git config polish.editor`, else VS Code `code`; `none` just prints the paths; `warp` opens a Warp tab and uses step mode |
 | push check (plugin) | on; `GIT_POLISH_PUSH_CHECK=0` turns it off |
 | author email | `git config polish.email <addr>` flags commits by any other address |
-| auto-open (plugin) | on; `GIT_POLISH_ON_COMMIT=0` turns it off. Never on main/master or during a rebase |
+| auto-open (plugin) | on; `GIT_POLISH_ON_COMMIT=0` turns it off. Never on main/master or during a rebase, and never starts step mode |
 
 ## Limits
 

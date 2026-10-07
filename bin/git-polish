@@ -9,6 +9,12 @@
 #                         lines (git absorb, then an autosquash rebase), and
 #                         edited message files reword their commit
 #   git polish into <N>   put what is still staged/modified into commit N
+#   git polish step [<base>]  review one commit at a time as uncommitted
+#                         changes, for review panels that only show the working
+#                         tree (Warp); whatever you change goes into that commit,
+#                         and COMMIT_MSG (a temporary file) is its message
+#   git polish next       commit the edits into the commit under review and
+#                         show the next one (`apply` does the same in step mode)
 #   git polish abort      drop the review state (your edits are kept)
 #   git polish check [<rev>...]   scan commits for leaks (secrets, names on
 #                         your forbid list, machine-name emails, private IPs);
@@ -19,14 +25,15 @@
 # <base> defaults to `git config polish.base`, else the merge-base with the
 # remote's default branch (origin/HEAD, origin/main, origin/master).
 # The editor is $GIT_POLISH_EDITOR, else `git config polish.editor`, else
-# VS Code's `code`; set it to `cursor`, `subl`, ... or `none`.
+# VS Code's `code`; set it to `cursor`, `subl`, ... or `none`. `warp` opens a
+# Warp tab and uses step mode.
 # Needs git-absorb. Nothing is ever pushed.
 
 set -e
 die() { echo "git polish: $*" >&2; exit 1; }
 self=$(perl -MCwd=abs_path -e 'print abs_path(shift)' "$0")
 scan="$(dirname "$self")/git-polish-scan"
-case "${1:-}" in -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+case "${1:-}" in -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
 
 top=$(git rev-parse --show-toplevel) || exit 1
 gitdir=$(git rev-parse --absolute-git-dir)
@@ -55,13 +62,18 @@ commits() { git rev-list --reverse "$1..HEAD"; }
 
 slug() { git log -1 --format=%s "$1" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-50 | sed 's/-*$//'; }
 
-start() {
+check_base() {
   in_progress && die "a rebase is in progress; finish it first"
   base=${1:-$(default_base)} || die "no base found; pass one: git polish <base>"
   base=$(git rev-parse "$base")
   n=$(git rev-list --count "$base..HEAD")
   [ "$n" -gt 0 ] || die "no commits between base and HEAD"
   [ "$n" -le 40 ] || die "$n commits since base; pass a closer base (git polish <base>)"
+}
+
+start() {
+  [ "$editor" = warp ] && { step_start "$@"; return; }
+  check_base "$@"
 
   rm -rf "$dir"; mkdir -p "$dir"
   i=0; index="$dir/00-INDEX.md"
@@ -94,6 +106,82 @@ start() {
   fi
 }
 
+# Step mode: an interactive rebase that stops on every commit and un-commits
+# it, so the commit's diff is the working tree's uncommitted changes.
+step_start() {
+  # Never start a rebase from the plugin's end-of-turn hook.
+  [ -z "${GIT_POLISH_AUTO:-}" ] || exit 0
+  check_base "$@"
+  git diff --quiet && git diff --cached --quiet ||
+    die "commit or stash your changes first"
+  rm -rf "$dir"; mkdir -p "$dir"
+  printf 'mode=step\nbase=%s\nhead=%s\nn=%s\n' "$base" "$(git rev-parse HEAD)" "$n" > "$state"
+  GIT_SEQUENCE_EDITOR="perl -pi -e 's/^pick /edit /'" git rebase -q -i "$base" >"$dir/rebase.log" 2>&1 ||
+    { cat "$dir/rebase.log" >&2; die "rebase did not start"; }
+  [ "$editor" = warp ] && open "warp://action/new_tab?path=$top" >/dev/null 2>&1 || true
+  step_show
+}
+
+# The rebase is stopped on a commit: either applied (an edit stop) or
+# conflicting (an earlier edit clashed with it). Show it as uncommitted changes.
+step_show() {
+  c=$(git rev-parse "$(cat "$gitdir/rebase-merge/stopped-sha")")
+  amend="$gitdir/rebase-merge/amend"
+  if [ -f "$amend" ] && [ "$(cat "$amend")" = "$(git rev-parse HEAD)" ]; then
+    git reset -q --soft HEAD^
+    git diff --cached --name-only --diff-filter=A -z > "$dir/added"
+    git reset -q
+    # Keep new files visible as diffs, not as untracked files.
+    xargs -0 git add -N -- < "$dir/added"
+  fi
+  git ls-files --others --exclude-standard > "$dir/untracked"
+  i=$(($(git rev-list --count "$base..HEAD") + 1))
+  # The message is a new file in the tree so the review panel shows it too.
+  msg="$top/COMMIT_MSG"
+  [ ! -e "$msg" ] || die "$msg exists; move it out of the way"
+  git log -1 --format=%B "$c" > "$msg"
+  git add -N -- "$msg"
+  printf 'current=%s\n' "$c" > "$dir/step"
+  echo "Commit $i/$n: $(git log -1 --format=%s "$c")"
+  if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+    echo "  It conflicts with your earlier edits; resolve the markers in:"
+    git diff --name-only --diff-filter=U | sed 's/^/    /'
+  fi
+  echo "  Review and edit it as uncommitted changes; edit COMMIT_MSG to reword."
+  echo "  Then: git polish next"
+}
+
+step_next() {
+  . "$dir/step"
+  # A conflicted file counts as resolved once its markers are gone.
+  for f in $(git diff --name-only --diff-filter=U); do
+    ! grep -q '^<<<<<<< ' "$top/$f" || die "resolve the conflicts in $f first"
+  done
+  msg="$dir/msg"
+  cp "$top/COMMIT_MSG" "$msg" 2>/dev/null || die "COMMIT_MSG is missing; recreate it with the message"
+  git rm -q --cached -f -- "$top/COMMIT_MSG" 2>/dev/null || true
+  rm -f "$top/COMMIT_MSG"
+  git add -u
+  # Files created during this step belong to it; untracked files from before do not.
+  git ls-files --others --exclude-standard > "$dir/untracked.now"
+  grep -vxF -f "$dir/untracked" "$dir/untracked.now" | while IFS= read -r f; do
+    git add -- "$f"; done || true
+  if git diff --cached --quiet; then
+    echo "Dropped (now empty): $(git log -1 --format=%s "$current")"
+  else
+    git commit -q --no-verify -C "$current"
+    git log -1 --format=%B "$current" | cmp -s - "$msg" ||
+      git commit -q --amend -F "$msg" ||
+      die "the reworded message was rejected; fix $msg and run: git commit --amend -F $msg"
+  fi
+  GIT_EDITOR=: git rebase --continue >/dev/null 2>&1 || true
+  if in_progress; then step_show; return; fi
+  echo "Done."
+  git range-diff -s "$base" "$head" HEAD 2>/dev/null | sed 's/^/  /' || true
+  "$scan" "$base..HEAD" || true
+  rm -rf "$dir"
+}
+
 load() {
   [ -f "$state" ] || die "no review in progress; run git polish first"
   . "$state"
@@ -101,6 +189,7 @@ load() {
 
 apply_() {
   load
+  [ "${mode:-}" = step ] && { step_next; return; }
   in_progress && die "a rebase is in progress; finish or abort it first"
   [ "$(git rev-parse HEAD)" = "$head" ] ||
     echo "note: HEAD moved since the review started; messages are matched by position"
@@ -207,8 +296,14 @@ into() {
 
 case "${1:-}" in
   apply) apply_ ;;
+  step) shift; step_start "$@" ;;
+  next) load; [ "${mode:-}" = step ] || die "not in step mode; use git polish apply"; step_next ;;
   into) shift; into "$@" ;;
-  abort) rm -rf "$dir"; echo "polish state removed" ;;
+  abort)
+    if [ -f "$state" ] && grep -q '^mode=step' "$state" && in_progress; then
+      die "step review in progress: run git polish next until done, or git rebase --abort (drops your edits)"
+    fi
+    rm -rf "$dir"; echo "polish state removed" ;;
   check) shift; check "$@" ;;
   check-push) check_push ;;
   install-hook) install_hook ;;
